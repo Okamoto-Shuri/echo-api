@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -8,14 +10,14 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+
+	_ "github.com/lib/pq" // PostgreSQLドライバ
 )
 
 // -----------------------------------------------------------------------
 // モデル
 // -----------------------------------------------------------------------
 
-// Task はタスク1件を表す構造体です。
-// validateタグでバリデーションルールを定義しています。
 type Task struct {
 	ID        int       `json:"id"`
 	Title     string    `json:"title"     validate:"required,min=1,max=100"`
@@ -23,49 +25,38 @@ type Task struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// CreateTaskRequest はタスク作成時のリクエストボディです。
 type CreateTaskRequest struct {
 	Title     string `json:"title"     validate:"required,min=1,max=100"`
 	Completed bool   `json:"completed"`
 }
 
-// UpdateTaskRequest はタスク更新時のリクエストボディです。
 type UpdateTaskRequest struct {
 	Title     string `json:"title"     validate:"required,min=1,max=100"`
 	Completed bool   `json:"completed"`
 }
 
-// -----------------------------------------------------------------------
-// ページネーション用レスポンス
-// -----------------------------------------------------------------------
-
-// PaginatedResponse はページネーション情報とデータを含むレスポンス構造体です。
 type PaginatedResponse struct {
-	Data       []Task `json:"data"`        // 現在のページのタスク一覧
-	Total      int    `json:"total"`       // 全タスク数
-	Page       int    `json:"page"`        // 現在のページ番号
-	Limit      int    `json:"limit"`       // 1ページあたりの件数
-	TotalPages int    `json:"total_pages"` // 総ページ数
+	Data       []Task `json:"data"`
+	Total      int    `json:"total"`
+	Page       int    `json:"page"`
+	Limit      int    `json:"limit"`
+	TotalPages int    `json:"total_pages"`
 }
 
 // -----------------------------------------------------------------------
-// カスタムバリデーター（Echoへの組み込み）
+// カスタムバリデーター
 // -----------------------------------------------------------------------
 
-// CustomValidator はgo-playground/validatorをEchoに組み込むためのアダプターです。
 type CustomValidator struct {
 	validator *validator.Validate
 }
 
-// Validate はEchoのValidatorインターフェースを満たすメソッドです。
 func (cv *CustomValidator) Validate(i interface{}) error {
 	return cv.validator.Struct(i)
 }
 
-// validationError はバリデーションエラーを人間が読みやすい形式に変換します。
 func validationError(err error) map[string]interface{} {
 	errors := map[string]string{}
-
 	for _, e := range err.(validator.ValidationErrors) {
 		switch e.Tag() {
 		case "required":
@@ -78,7 +69,6 @@ func validationError(err error) map[string]interface{} {
 			errors[e.Field()] = "入力値が不正です（" + e.Tag() + "）"
 		}
 	}
-
 	return map[string]interface{}{
 		"message": "バリデーションエラーが発生しました",
 		"errors":  errors,
@@ -86,23 +76,16 @@ func validationError(err error) map[string]interface{} {
 }
 
 // -----------------------------------------------------------------------
-// インメモリストレージ
+// ハンドラー（DB依存を注入する構造体）
 // -----------------------------------------------------------------------
 
-var tasks = []Task{}
-var nextID = 1
-
-// -----------------------------------------------------------------------
-// ハンドラー
-// -----------------------------------------------------------------------
+// TaskHandler はDB接続を保持し、各エンドポイントの処理を担当します。
+type TaskHandler struct {
+	DB *sql.DB
+}
 
 // 1. 【Read】タスク一覧を取得（ページネーション対応）
-//
-//	GET /tasks?page=1&limit=10
-//	  page  : ページ番号（デフォルト: 1）
-//	  limit : 1ページあたりの件数（デフォルト: 10、最大: 100）
-func getTasks(c echo.Context) error {
-	// --- クエリパラメータのパースとデフォルト値の設定 ---
+func (h *TaskHandler) getTasks(c echo.Context) error {
 	page, err := strconv.Atoi(c.QueryParam("page"))
 	if err != nil || page < 1 {
 		page = 1
@@ -113,33 +96,37 @@ func getTasks(c echo.Context) error {
 		limit = 10
 	}
 	if limit > 100 {
-		limit = 100 // 上限を設けて過大なリクエストを防ぐ
+		limit = 100
 	}
 
-	// --- ページネーション計算 ---
-	total := len(tasks)
-	totalPages := (total + limit - 1) / limit // 切り上げ除算
-
-	// ページ番号が範囲外の場合は空のデータを返す
-	start := (page - 1) * limit
-	if start >= total {
-		return c.JSON(http.StatusOK, PaginatedResponse{
-			Data:       []Task{},
-			Total:      total,
-			Page:       page,
-			Limit:      limit,
-			TotalPages: totalPages,
-		})
+	// 全件数の取得
+	var total int
+	err = h.DB.QueryRow("SELECT COUNT(*) FROM tasks").Scan(&total)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "データベースエラー"})
 	}
 
-	// スライスの終端インデックスが配列長を超えないよう調整
-	end := start + limit
-	if end > total {
-		end = total
+	totalPages := (total + limit - 1) / limit
+	offset := (page - 1) * limit
+
+	// レコードの取得 (OFFSET と LIMIT を使用)
+	rows, err := h.DB.Query("SELECT id, title, completed, created_at FROM tasks ORDER BY id LIMIT $1 OFFSET $2", limit, offset)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "データベースエラー"})
+	}
+	defer rows.Close()
+
+	tasks := []Task{} // nilスライスではなく空スライスで初期化し、JSONでnullにならないようにする
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Title, &t.Completed, &t.CreatedAt); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": "データ読み込みエラー"})
+		}
+		tasks = append(tasks, t)
 	}
 
 	return c.JSON(http.StatusOK, PaginatedResponse{
-		Data:       tasks[start:end],
+		Data:       tasks,
 		Total:      total,
 		Page:       page,
 		Limit:      limit,
@@ -148,111 +135,94 @@ func getTasks(c echo.Context) error {
 }
 
 // 2. 【Create】タスクを新規作成
-//
-//	POST /tasks
-func createTask(c echo.Context) error {
+func (h *TaskHandler) createTask(c echo.Context) error {
 	req := new(CreateTaskRequest)
-
 	if err := c.Bind(req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"message": "リクエストの形式が正しくありません",
-		})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "リクエストの形式が正しくありません"})
 	}
-
-	// バリデーション実行
 	if err := c.Validate(req); err != nil {
 		return c.JSON(http.StatusUnprocessableEntity, validationError(err))
 	}
 
-	task := Task{
-		ID:        nextID,
-		Title:     req.Title,
-		Completed: req.Completed,
-		CreatedAt: time.Now(),
+	var task Task
+	// RETURNING句を使って、DB側で採番されたIDとタイムスタンプを即座に取得
+	query := `INSERT INTO tasks (title, completed) VALUES ($1, $2) RETURNING id, title, completed, created_at`
+	err := h.DB.QueryRow(query, req.Title, req.Completed).Scan(&task.ID, &task.Title, &task.Completed, &task.CreatedAt)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "タスクの保存に失敗しました"})
 	}
-	nextID++
-	tasks = append(tasks, task)
 
 	return c.JSON(http.StatusCreated, task)
 }
 
 // 3. 【Read】指定したIDのタスクを取得
-//
-//	GET /tasks/:id
-func getTask(c echo.Context) error {
+func (h *TaskHandler) getTask(c echo.Context) error {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"message": "IDは数値で指定してください",
-		})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "IDは数値で指定してください"})
 	}
 
-	for _, t := range tasks {
-		if t.ID == id {
-			return c.JSON(http.StatusOK, t)
-		}
+	var t Task
+	err = h.DB.QueryRow("SELECT id, title, completed, created_at FROM tasks WHERE id = $1", id).
+		Scan(&t.ID, &t.Title, &t.Completed, &t.CreatedAt)
+
+	if err == sql.ErrNoRows {
+		return c.JSON(http.StatusNotFound, map[string]string{"message": "タスクが見つかりません"})
+	} else if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "データベースエラー"})
 	}
-	return c.JSON(http.StatusNotFound, map[string]string{
-		"message": "タスクが見つかりません",
-	})
+
+	return c.JSON(http.StatusOK, t)
 }
 
 // 4. 【Update】指定したIDのタスクを更新
-//
-//	PUT /tasks/:id
-func updateTask(c echo.Context) error {
+func (h *TaskHandler) updateTask(c echo.Context) error {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"message": "IDは数値で指定してください",
-		})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "IDは数値で指定してください"})
 	}
 
 	req := new(UpdateTaskRequest)
-
 	if err := c.Bind(req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"message": "リクエストの形式が正しくありません",
-		})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "リクエストの形式が正しくありません"})
 	}
-
-	// バリデーション実行
 	if err := c.Validate(req); err != nil {
 		return c.JSON(http.StatusUnprocessableEntity, validationError(err))
 	}
 
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].Title = req.Title
-			tasks[i].Completed = req.Completed
-			return c.JSON(http.StatusOK, tasks[i])
-		}
+	// 更新処理。対象が存在するかどうかを RowsAffected で確認
+	res, err := h.DB.Exec("UPDATE tasks SET title = $1, completed = $2 WHERE id = $3", req.Title, req.Completed, id)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "更新に失敗しました"})
 	}
-	return c.JSON(http.StatusNotFound, map[string]string{
-		"message": "タスクが見つかりません",
-	})
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"message": "タスクが見つかりません"})
+	}
+
+	// 更新後のデータを取得して返す
+	return h.getTask(c)
 }
 
 // 5. 【Delete】指定したIDのタスクを削除
-//
-//	DELETE /tasks/:id
-func deleteTask(c echo.Context) error {
+func (h *TaskHandler) deleteTask(c echo.Context) error {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"message": "IDは数値で指定してください",
-		})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "IDは数値で指定してください"})
 	}
 
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks = append(tasks[:i], tasks[i+1:]...)
-			return c.NoContent(http.StatusNoContent)
-		}
+	res, err := h.DB.Exec("DELETE FROM tasks WHERE id = $1", id)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "削除に失敗しました"})
 	}
-	return c.JSON(http.StatusNotFound, map[string]string{
-		"message": "タスクが見つかりません",
-	})
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{"message": "タスクが見つかりません"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
 }
 
 // -----------------------------------------------------------------------
@@ -260,21 +230,36 @@ func deleteTask(c echo.Context) error {
 // -----------------------------------------------------------------------
 
 func main() {
+	// データベース接続
+	// ※実際の運用では環境変数(os.Getenv)から取得するようにします
+	connStr := "host=localhost port=5432 user=postgres password=postgres dbname=todo sslmode=disable"
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("データベース接続エラー: %v", err)
+	}
+	defer db.Close()
+
+	// 接続確認
+	if err := db.Ping(); err != nil {
+		log.Fatalf("データベースPingエラー: %v", err)
+	}
+
+	// ハンドラーの初期化（DBを注入）
+	h := &TaskHandler{DB: db}
+
 	e := echo.New()
 
-	// ミドルウェア
-	e.Use(middleware.Logger())  // リクエストログ
-	e.Use(middleware.Recover()) // パニック時のリカバリ
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
 
-	// カスタムバリデーターの登録
 	e.Validator = &CustomValidator{validator: validator.New()}
 
-	// ルーティング
-	e.GET("/tasks", getTasks)
-	e.POST("/tasks", createTask)
-	e.GET("/tasks/:id", getTask)
-	e.PUT("/tasks/:id", updateTask)
-	e.DELETE("/tasks/:id", deleteTask)
+	// ルーティング（メソッドを紐付け）
+	e.GET("/tasks", h.getTasks)
+	e.POST("/tasks", h.createTask)
+	e.GET("/tasks/:id", h.getTask)
+	e.PUT("/tasks/:id", h.updateTask)
+	e.DELETE("/tasks/:id", h.deleteTask)
 
 	e.Logger.Fatal(e.Start(":8080"))
 }
