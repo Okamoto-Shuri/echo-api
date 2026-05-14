@@ -232,7 +232,7 @@ func (h *TaskHandler) deleteTask(c echo.Context) error {
 func main() {
 	// データベース接続
 	// ※実際の運用では環境変数(os.Getenv)から取得するようにします
-	connStr := "host=localhost port=5432 user=postgres password=postgres dbname=todo sslmode=disable"
+	connStr := "host=127.0.0.1 port=15432 user=postgres password=postgres dbname=todo sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatalf("データベース接続エラー: %v", err)
