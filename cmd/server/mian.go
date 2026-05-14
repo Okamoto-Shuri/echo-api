@@ -22,6 +22,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	_ "github.com/lib/pq"
+	"golang.org/x/time/rate"
 )
 
 func main() {
@@ -86,7 +87,7 @@ func main() {
 
 	// 改善⑦: レートリミット（メモリストア、分散環境では Redis に切り替え）
 	e.Use(middleware.RateLimiter(
-		middleware.NewRateLimiterMemoryStore(cfg.Server.RateLimit),
+		middleware.NewRateLimiterMemoryStore(rate.Limit(cfg.Server.RateLimit)),
 	))
 
 	// 構造化ログ（slog 経由で JSON 出力）
